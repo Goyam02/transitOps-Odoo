@@ -10,6 +10,7 @@
 
 ## 2. Tech Stack
 
+### Core Backend
 | Layer | Choice | Rationale |
 |---|---|---|
 | **Language** | Python 3.12 | Fastest iteration, rich ecosystem |
@@ -19,10 +20,16 @@
 | **Auth** | `python-jose` (JWT) + `passlib` (bcrypt) | Stateless, RBAC-friendly |
 | **Validation** | Pydantic v2 | Co-located with FastAPI, zero extra cost |
 | **Scheduling** | APScheduler | License expiry reminders — no Celery overhead |
-| **Export** | `pandas` (CSV) + `reportlab` (PDF) | Minimal deps |
+| **Export** | `pandas` (CSV) | Minimal deps (PDF deferred — see cut list) |
 | **Testing** | `pytest` + `httpx` | Fast async test client |
 | **Container** | Docker + Docker Compose | One-command startup |
-| **Frontend** | TBD (mockup-driven, React/Vite) | Decoupled SPA |
+
+### P1 — GenAI & Map
+| Layer | Choice | Rationale |
+|---|---|---|
+| **LLM** | Any OpenAI-compatible API (e.g. Gemini, GPT-4o) | Single `llm_service` wrapper, swappable |
+| **Map (FE)** | `react-leaflet` + OpenStreetMap tiles | Free, no API key, works offline |
+| **Geocoding** | Static depot lookup table (hardcoded lat/lng) | No external geocoding API needed for demo |
 
 ---
 
@@ -39,6 +46,8 @@
 │                   FastAPI Application                       │
 │   /auth  /vehicles  /drivers  /trips  /maintenance         │
 │   /fuel-logs  /expenses  /dashboard  /reports              │
+│   /fleet/locations  /trips/suggest  /dashboard/briefing    │  ← P1
+│   /chat/ask (P2)   /trips/autopilot/* (P3)                 │
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐  │
 │   │          Dependency Injection Layer                  │  │
@@ -47,14 +56,17 @@
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐  │
 │   │              Service Layer                           │  │
-│   │   trip_service  maintenance_service  report_service  │  │
+│   │  trip_service  maintenance_service  report_service   │  │
+│   │  llm_service (P1) — single wrapper for all AI calls  │  │
 │   └─────────────────────────────────────────────────────┘  │
 └────────────────────────┬────────────────────────────────────┘
                          │ SQLAlchemy async
 ┌────────────────────────▼────────────────────────────────────┐
 │                    PostgreSQL 16                             │
 │  Tables: users, roles, vehicles, drivers, trips,           │
-│          maintenance_logs, fuel_logs, expenses             │
+│          maintenance_logs, fuel_logs, expenses,            │
+│          depots (P1), briefing_cache (P1),                 │
+│          dispatch_suggestions (P1, optional log)           │
 │  Views:  vw_fleet_kpis, vw_vehicle_cost_summary           │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -77,12 +89,15 @@ transitops/
 │   │   └── init_db.py           # Seed roles & default admin
 │   ├── models/                  # ORM models (one file per entity)
 │   │   ├── user.py
-│   │   ├── vehicle.py
+│   │   ├── vehicle.py           # includes lat, lng fields (P1)
 │   │   ├── driver.py
 │   │   ├── trip.py
 │   │   ├── maintenance_log.py
 │   │   ├── fuel_log.py
-│   │   └── expense.py
+│   │   ├── expense.py
+│   │   ├── depot.py             # P1 — static name→lat/lng lookup
+│   │   ├── briefing_cache.py    # P1 — cached AI daily briefing
+│   │   └── dispatch_suggestion.py  # P1 optional — AI suggestion log
 │   ├── schemas/                 # Pydantic v2 request/response DTOs
 │   │   ├── auth.py
 │   │   ├── vehicle.py
@@ -94,18 +109,22 @@ transitops/
 │   ├── api/v1/
 │   │   ├── router.py            # Aggregates all sub-routers
 │   │   ├── auth.py
-│   │   ├── dashboard.py
+│   │   ├── dashboard.py         # includes /briefing endpoint (P1)
 │   │   ├── vehicles.py
 │   │   ├── drivers.py
-│   │   ├── trips.py
+│   │   ├── trips.py             # includes /suggest endpoint (P1)
 │   │   ├── maintenance.py
 │   │   ├── fuel_logs.py
 │   │   ├── expenses.py
-│   │   └── reports.py
+│   │   ├── reports.py
+│   │   ├── fleet.py             # P1 — /fleet/locations for map
+│   │   ├── chat.py              # P2 — Ask TransitOps widget
+│   │   └── autopilot.py         # P3 — Control Tower
 │   └── services/                # Pure business logic (no HTTP)
 │       ├── trip_service.py
 │       ├── maintenance_service.py
-│       └── report_service.py
+│       ├── report_service.py
+│       └── llm_service.py       # P1 — single LLM wrapper, reused by all AI features
 ├── alembic/
 │   ├── env.py
 │   └── versions/
@@ -239,3 +258,60 @@ FastAPI provides interactive docs out-of-the-box:
 - **Swagger UI**: `http://localhost:8000/docs`
 - **ReDoc**: `http://localhost:8000/redoc`
 - **OpenAPI JSON**: `http://localhost:8000/openapi.json`
+
+---
+
+## 9. GenAI Architecture (P1)
+
+### LLM Service — Single Wrapper Pattern
+All three AI features share one `llm_service.py`. It takes structured JSON context + a task prompt and returns structured text. Build once, reuse everywhere.
+
+```python
+# services/llm_service.py
+async def call_llm(system_prompt: str, user_context: dict) -> str:
+    """Single entry point for all LLM calls. Swap model by changing config."""
+    response = await openai_client.chat.completions.create(
+        model=settings.LLM_MODEL,  # e.g. "gpt-4o-mini" or "gemini-1.5-flash"
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_context)},
+        ],
+        max_tokens=500,
+    )
+    return response.choices[0].message.content
+```
+
+### Feature → Endpoint → Service mapping
+
+| Feature | Endpoint | Reuses | Cached? |
+|---|---|---|---|
+| AI Dispatch Advisor | `POST /trips/suggest` | Eligibility filter from `trip_service` | No (per-request) |
+| AI Daily Briefing | `POST /dashboard/briefing` | `vw_fleet_kpis` + recent trips | Yes — `briefing_cache` table (TTL ~5 min) |
+| Ask TransitOps (P2) | `POST /chat/ask` | Direct context stuffing from DB | No |
+
+### Fallback Strategy
+Cache one pre-generated LLM response for each AI feature (against seed data). If the live LLM call fails or times out during judging, the fallback response is returned silently — no UI hang.
+
+### Live Fleet Map
+- Library: `react-leaflet` + OpenStreetMap (free, no API key)
+- Vehicle markers colour-coded: 🟢 Available · 🔵 On Trip · 🟠 In Shop · 🔴 Retired
+- `Vehicle.lat` / `Vehicle.lng` = last trip's destination, or home depot if idle
+- Static `depots` table maps depot names used in the mockups to hardcoded lat/lng
+  - Gandhinagar Depot, Ahmedabad Hub, Vatva Industrial Area, Sanand Warehouse, Mansa, Kalol Depot
+- On Trip Dispatcher: selecting Source + Destination draws a straight-line polyline and auto-fills Planned Distance (no real routing API)
+- Endpoint: `GET /fleet/locations` → `[{vehicle_id, registration_number, status, lat, lng}]`
+
+---
+
+## 10. Explicit Cut List
+
+> Features deliberately excluded from this hackathon build.
+
+- ❌ Real GPS / live vehicle telemetry
+- ❌ Real routing or geocoding API integration (static depot table used instead)
+- ❌ Predictive maintenance via trained ML model
+- ❌ Voice input
+- ❌ RAG / vector DB for the chat widget (direct context stuffing only)
+- ❌ PDF export (CSV is mandatory; PDF is optional and deprioritised)
+- ❌ Email reminders for license expiry (bonus in spec — APScheduler log-only is sufficient)
+- ❌ P3 Control Tower attempted only after P0 + P1 are fully stable with time remaining

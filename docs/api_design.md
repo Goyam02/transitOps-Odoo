@@ -32,6 +32,7 @@
 |---|---|---|---|
 | `GET` | `/dashboard` | All | Aggregated KPIs |
 | `GET` | `/dashboard/active-trips` | All | Live trip feed |
+| `POST` | `/dashboard/briefing` | All | **(P1)** AI Daily Ops Briefing (cached) |
 
 ### GET `/dashboard`
 Query params: `?vehicle_type=Van&region=North`
@@ -270,7 +271,8 @@ Side effects: `vehicle.status → available` (unless retired)
 | `GET` | `/reports/operational-cost` | fleet_manager, financial_analyst | Cost breakdown |
 | `GET` | `/reports/vehicle-roi` | fleet_manager, financial_analyst | ROI per vehicle |
 | `GET` | `/reports/export/csv` | fleet_manager, financial_analyst | CSV download |
-| `GET` | `/reports/export/pdf` | fleet_manager, financial_analyst | PDF download |
+
+> **Note:** PDF export is deprioritised — CSV is the mandatory deliverable. PDF only if time remains.
 
 ### GET `/reports/vehicle-roi`
 **Response:**
@@ -295,7 +297,118 @@ Returns `Content-Type: text/csv` with `Content-Disposition: attachment; filename
 
 ---
 
-## Common Response Patterns
+## P1 — GenAI & Fleet Map Endpoints
+
+### Fleet Map
+| Method | Path | Roles | Description |
+|---|---|---|---|
+| `GET` | `/fleet/locations` | All | Vehicle lat/lng for map rendering |
+
+**GET `/fleet/locations`**
+```json
+[
+  {
+    "vehicle_id": "uuid",
+    "registration_number": "GJ-01-AA-0001",
+    "name": "Van-05",
+    "status": "available",
+    "lat": 23.2156,
+    "lng": 72.6369
+  }
+]
+```
+
+---
+
+### AI Dispatch Advisor
+| Method | Path | Roles | Description |
+|---|---|---|---|
+| `POST` | `/trips/suggest` | fleet_manager, dispatcher | Ranked driver/vehicle suggestions |
+
+**POST `/trips/suggest`**
+```json
+// Request
+{
+  "source": "Gandhinagar Depot",
+  "destination": "Ahmedabad Hub",
+  "cargo_weight_kg": 450.0,
+  "planned_distance_km": 35.0
+}
+
+// Response
+{
+  "suggestions": [
+    {
+      "rank": 1,
+      "vehicle_id": "uuid",
+      "vehicle_name": "Van-05",
+      "driver_id": "uuid",
+      "driver_name": "Alex Fernandes",
+      "reason": "Capacity fits with 50 kg margin, 96% safety score, no active trips."
+    },
+    {
+      "rank": 2,
+      "vehicle_id": "uuid",
+      "vehicle_name": "Van-03",
+      "driver_id": "uuid",
+      "driver_name": "Raj Patel",
+      "reason": "Capacity OK, safety score 87%, licence valid until 2028."
+    }
+  ],
+  "excluded": "Truck-11 excluded — currently On Trip."
+}
+```
+
+> **Implementation note:** The LLM only ranks and explains a pre-filtered candidate list. Eligibility filtering (capacity, licence validity, status checks) is always done in `trip_service` first. The LLM never re-derives eligibility.
+
+---
+
+### AI Daily Ops Briefing
+| Method | Path | Roles | Description |
+|---|---|---|---|
+| `POST` | `/dashboard/briefing` | All | Cached AI narrative summary |
+
+**POST `/dashboard/briefing`** — no body required
+```json
+// Response
+{
+  "content": "Fleet utilization is at 81%. Driver John’s license expired 3/25/2025 and he is blocked from dispatch. Truck-11 has generated ₹28,750 in maintenance+fuel this month — the highest in the fleet.",
+  "generated_at": "2026-07-12T08:00:00Z",
+  "cached": true
+}
+```
+
+> Checks `briefing_cache` table first. If no non-expired row exists, calls LLM and caches result for 5 minutes.
+
+---
+
+## P2 — Ask TransitOps Chat Widget
+
+| Method | Path | Roles | Description |
+|---|---|---|---|
+| `POST` | `/chat/ask` | All | Natural-language Q&A over fleet data |
+
+**POST `/chat/ask`**
+```json
+// Request
+{ "question": "Which drivers have licences expiring this month?" }
+
+// Response
+{ "answer": "Two drivers have licences expiring in July 2026: Alex Fernandes (Jul 15) and Raj Patel (Jul 28)." }
+```
+
+> Uses direct context-stuffing — no RAG or vector DB.
+
+---
+
+## P3 — Control Tower (Autonomous Dispatch)
+
+| Method | Path | Roles | Description |
+|---|---|---|---|
+| `POST` | `/trips/autopilot/toggle` | fleet_manager | Enable/disable autonomous dispatch |
+| `GET` | `/trips/autopilot/feed` | fleet_manager, dispatcher | Polling event feed for agent narration |
+
+> **Only build if P0 + P1 are fully stable with time remaining.**
 
 ### Paginated List
 ```json

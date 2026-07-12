@@ -1,23 +1,43 @@
 # TransitOps — Implementation Plan
 
-> **Goal:** Production-grade backend in ~6 hours. FE deferred to mockup review.
+> **Goal:** Production-grade backend in ~6 hours, GenAI differentiators in hours 2.5–5.
 > **Stack:** FastAPI + PostgreSQL + SQLAlchemy 2.x + Docker
+> **Team:** 2 Backend devs, 1 Frontend dev
 
 ---
 
-## Timeline Overview (8-Hour Hackathon)
+## Priority Order (build in this sequence)
 
-| Phase | Time | Output |
+| Priority | Feature | Phase |
 |---|---|---|
-| **Phase 0 — Scaffold** | 0:00 – 0:30 | Project skeleton, Docker, config |
-| **Phase 1 — Data Layer** | 0:30 – 1:30 | Models, enums, migrations, seed |
-| **Phase 2 — Auth** | 1:30 – 2:00 | Login, JWT, RBAC dependencies |
-| **Phase 3 — Core CRUD** | 2:00 – 3:30 | Vehicles, Drivers endpoints |
-| **Phase 4 — Trip Engine** | 3:30 – 4:30 | Trip lifecycle + state machine |
-| **Phase 5 — Maintenance** | 4:30 – 5:00 | Maintenance workflow |
-| **Phase 6 — Fuel & Expense** | 5:00 – 5:30 | Fuel logs + expenses |
-| **Phase 7 — Dashboard & Reports** | 5:30 – 6:30 | KPIs, analytics, export |
-| **Phase 8 — Polish & FE** | 6:30 – 8:00 | Tests, FE integration (mockup-based) |
+| **P0** | Auth + RBAC | Phase 2 |
+| **P0** | Vehicle Registry (CRUD) | Phase 3 |
+| **P0** | Driver Management (CRUD) | Phase 3 |
+| **P0** | Trip Management + lifecycle + validation | Phase 4 |
+| **P0** | Maintenance workflow | Phase 5 |
+| **P0** | Fuel & Expense logging | Phase 6 |
+| **P0** | Dashboard KPIs | Phase 7 |
+| **P0** | Reports & Analytics + CSV export | Phase 7 |
+| **P1** | Live Fleet Map | Phase 8 |
+| **P1** | AI Dispatch Advisor | Phase 8 |
+| **P1** | AI Daily Ops Briefing | Phase 8 |
+| **P2** | "Ask TransitOps" Chat Widget | Phase 9 (if ahead) |
+| **P3** | Control Tower — Autonomous Dispatch | Phase 9 (if ahead) |
+
+> **Rule:** Do not start P2 or P3 until every P0 and P1 item is functional and demo-ready.
+
+---
+
+## Timeline Overview (6–7 Hour Team Sprint)
+
+| Hour | Backend Dev 1 | Backend Dev 2 | Frontend Dev |
+|---|---|---|---|
+| 0–1 | Auth/RBAC + schema | Vehicle/Driver/Trip CRUD APIs | Login, Dashboard shell, nav |
+| 1–2.5 | Trip lifecycle + status transitions | Maintenance + Fuel/Expense APIs + cost calc | Vehicle Registry, Drivers, Trip Dispatcher UI |
+| 2.5–4 | Reports/analytics endpoints | Build `llm_service` + **AI Dispatch Advisor** endpoint | **Live Fleet Map** integration (Leaflet) |
+| 4–5 | Bug fixes, edge cases, seed data | **AI Daily Briefing** endpoint | Wire AI Suggest button + briefing card into UI |
+| 5–6 | *(if ahead)* Control Tower backend | *(if ahead)* Chat widget or Control Tower agent loop | *(if ahead)* Autopilot toggle + event feed UI |
+| 6–7 | Full team: demo run-through, fallback checks, polish | | |
 
 ---
 
@@ -33,6 +53,7 @@
 
 ### `requirements.txt`
 ```
+# Core
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 sqlalchemy[asyncio]==2.0.36
@@ -44,8 +65,12 @@ python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-multipart==0.0.12
 pandas==2.2.3
-reportlab==4.2.5
 apscheduler==3.10.4
+
+# P1 GenAI
+openai==1.51.0              # works with Gemini's OpenAI-compat endpoint too
+
+# Testing
 pytest==8.3.3
 httpx==0.27.2
 pytest-asyncio==0.24.0
@@ -398,26 +423,108 @@ async def seed_demo_data(db: AsyncSession):
 
 ---
 
-## Checklist: Mandatory Deliverables
+## Phase 8 — GenAI & Fleet Map (P1) (60 min)
+
+### Steps
+1. Write `services/llm_service.py` — single async wrapper for all LLM calls
+2. Seed `depots` table with hardcoded lat/lng (Gandhinagar, Ahmedabad, Vatva, Sanand, Mansa, Kalol)
+3. Add `lat`, `lng`, `depot_id` to `Vehicle` model
+4. Write `GET /fleet/locations` endpoint in `api/v1/fleet.py`
+5. Write `POST /trips/suggest` — filter eligible candidates in `trip_service`, pass to `llm_service` for ranking
+6. Write `POST /dashboard/briefing` — check `briefing_cache`, call LLM if stale, cache result
+7. Pre-generate and hardcode **one fallback response** for each AI endpoint against seed data
+
+### `services/llm_service.py` pattern
+```python
+import openai, json
+from app.core.config import settings
+
+client = openai.AsyncOpenAI(
+    api_key=settings.LLM_API_KEY,
+    base_url=settings.LLM_BASE_URL,  # swap to Gemini OpenAI-compat URL if needed
+)
+
+async def call_llm(system_prompt: str, context: dict) -> str:
+    try:
+        resp = await client.chat.completions.create(
+            model=settings.LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(context, default=str)},
+            ],
+            max_tokens=500,
+        )
+        return resp.choices[0].message.content
+    except Exception:
+        return None  # caller falls back to hardcoded response
+```
+
+### AI Dispatch Advisor pattern
+```python
+# api/v1/trips.py
+@router.post("/suggest")
+async def suggest_dispatch(payload: SuggestPayload, db=Depends(get_db)):
+    # 1. Filter eligible vehicles + drivers using existing trip_service logic
+    candidates = await trip_service.get_eligible_candidates(
+        payload.cargo_weight_kg, payload.planned_distance_km, db
+    )
+    # 2. Call LLM to rank and explain (LLM never re-derives eligibility)
+    result = await llm_service.call_llm(
+        system_prompt=DISPATCH_ADVISOR_PROMPT,
+        context={"candidates": candidates, **payload.model_dump()}
+    )
+    return result or DISPATCH_ADVISOR_FALLBACK
+```
+
+---
+
+## Phase 9 — P2/P3 (only if ahead of schedule)
+
+- **P2 — Ask TransitOps:** `POST /chat/ask` — stuff relevant table data as context, pass user question to `llm_service`
+- **P3 — Control Tower:** Autopilot toggle + event feed. Reuses eligibility logic + AI Dispatch Advisor. Auto-dispatches only on unambiguous matches; escalates conflicts to pending queue.
+
+---
+
+## Checklist: Mandatory Deliverables (P0)
 
 - [ ] Authentication with RBAC (JWT + 4 roles)
 - [ ] Vehicles CRUD + status transitions
 - [ ] Drivers CRUD + eligibility checks
 - [ ] Trip Management: Draft → Dispatch → Complete/Cancel
-- [ ] All 9 business rules enforced in service layer
+- [ ] All 12 business rules enforced in service layer
 - [ ] Maintenance workflow (auto In Shop, auto restore)
 - [ ] Fuel Log CRUD
 - [ ] Expense CRUD
+- [ ] Settings: depot name, currency, distance unit + role-permission matrix view
 - [ ] Dashboard KPIs endpoint
 - [ ] Reports: fuel efficiency, fleet utilization, operational cost, ROI
 - [ ] CSV export
 - [ ] Docker Compose (one-command start)
 - [ ] Auto-generated Swagger docs
 
-## Bonus Checklist
+## P1 Checklist (Differentiators)
 
-- [ ] PDF export (reportlab)
-- [ ] License expiry scheduler (APScheduler)
+- [ ] Live Fleet Map (`react-leaflet` + static depot lat/lng)
+- [ ] `GET /fleet/locations` endpoint
+- [ ] `POST /trips/suggest` — AI Dispatch Advisor with ranked candidates
+- [ ] `POST /dashboard/briefing` — AI Daily Ops Briefing (cached 5 min)
+- [ ] Fallback hardcoded responses for all AI endpoints
+
+## P2/P3 Checklist (Stretch)
+
+- [ ] Ask TransitOps chat widget (`POST /chat/ask`) — P2
+- [ ] Control Tower autopilot toggle + event feed — P3
 - [ ] Dark mode in FE
-- [ ] Charts in FE (Chart.js / Recharts)
-- [ ] Vehicle document upload
+- [ ] APScheduler license expiry log alerts
+
+---
+
+## Demo Script (3–4 minutes)
+
+1. **Login as Dispatcher** → Dashboard: point out AI Daily Briefing card + live map with colour-coded vehicle markers
+2. **Trip Dispatcher:** create a trip, click **AI Suggest** → show ranked recommendation with one-line reasoning
+3. **Validation demo:** try cargo weight > vehicle capacity → show hard block with inline error
+4. **Dispatch** → vehicle/driver flip to On Trip live on the map
+5. **Complete a trip** → **Maintenance:** create service record → vehicle auto-switches to In Shop, disappears from dispatch pool
+6. **Reports:** show fuel efficiency / ROI numbers auto-calculated
+7. *(If P3 built)* flip Autopilot on, fire pre-seeded trip requests, show one auto-approved + one correctly escalated on a real conflict
