@@ -56,7 +56,7 @@ async def get_me(
 @router.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     request: UserCreateRequest,
-    current_user: User = Depends(require_roles("fleet_manager")),
+    current_user: User = require_roles("fleet_manager"),
     db: AsyncSession = Depends(get_db)
 ):
     # Lookup role

@@ -1,4 +1,4 @@
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Query
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -50,4 +50,16 @@ def require_roles(*roles: str):
                 detail="You do not have permission to perform this action"
             )
         return user
-    return check_role
+    return Depends(check_role)
+
+class PaginationParams:
+    def __init__(
+        self,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=100),
+    ):
+        self.page = page
+        self.page_size = page_size
+        self.offset = (page - 1) * page_size
+        self.limit = page_size
+
